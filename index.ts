@@ -148,6 +148,7 @@ interface ProRunParams {
 	model: string;
 	isolatedWorkspaces: boolean;
 	yolo: boolean;
+	timeoutSeconds?: number;
 	source: "command" | "tool";
 }
 
@@ -226,6 +227,9 @@ const ProModeParams = Type.Object({
 	),
 	yolo: Type.Optional(
 		Type.Boolean({ description: "Skip interactive approval prompts in code mode. Research mode ignores this flag." }),
+	),
+	timeoutSeconds: Type.Optional(
+		Type.Integer({ minimum: 1, maximum: 3600, description: "Per-child timeout in seconds. Timed-out workers are cut off and the stage continues." }),
 	),
 });
 
@@ -980,7 +984,7 @@ async function captureWorkspaceDiff(cwd: string, signal: AbortSignal | undefined
 	return { changedFiles, diffText };
 }
 
-async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onUpdate?: (result: RuntimeRunResult) => void): Promise<RuntimeRunResult> {
+async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onUpdate?: (result: RuntimeRunResult) => void, timeoutSeconds?: number): Promise<RuntimeRunResult> {
 	const runtimeResult: RuntimeRunResult = {
 		id: spec.id,
 		label: spec.label,
@@ -1011,8 +1015,23 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 
 		const invocation = getPiInvocation(args);
 		let wasAborted = false;
+		let wasTimedOut = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
+			const childController = new AbortController();
+			const forwardAbort = () => childController.abort();
+			if (signal?.aborted) forwardAbort();
+			else signal?.addEventListener("abort", forwardAbort, { once: true });
+			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+			if (timeoutSeconds && timeoutSeconds > 0) {
+				timeoutHandle = setTimeout(() => {
+					wasTimedOut = true;
+					runtimeResult.lastActivityAt = Date.now();
+					runtimeResult.lastActivity = `timed out after ${timeoutSeconds}s`;
+					onUpdate?.(runtimeResult);
+					childController.abort();
+				}, timeoutSeconds * 1000);
+			}
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: spec.cwd,
 				shell: false,
@@ -1089,32 +1108,33 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 			});
 
 			proc.on("close", (code) => {
+				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (stdoutBuffer.trim()) processLine(stdoutBuffer);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
+				if (timeoutHandle) clearTimeout(timeoutHandle);
 				resolve(1);
 			});
 
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 3000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+			const killProc = () => {
+				wasAborted = true;
+				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 3000);
+			};
+			if (childController.signal.aborted) killProc();
+			else childController.signal.addEventListener("abort", killProc, { once: true });
 		});
 
 		runtimeResult.exitCode = exitCode;
 		runtimeResult.endedAt = Date.now();
 		if (wasAborted) {
-			runtimeResult.exitCode = 1;
-			runtimeResult.errorMessage = runtimeResult.errorMessage || "aborted";
+			runtimeResult.exitCode = wasTimedOut ? 124 : 1;
+			runtimeResult.errorMessage = runtimeResult.errorMessage || (wasTimedOut ? `timed out after ${timeoutSeconds}s` : "aborted");
+			if (wasTimedOut) runtimeResult.lastActivity = runtimeResult.lastActivity || `timed out after ${timeoutSeconds}s`;
 		}
 		return runtimeResult;
 	} finally {
@@ -1233,7 +1253,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					const result = await runChild(spec, ctx.signal, (partial) => {
 						upsertResult(partial);
 						emit();
-					});
+					}, params.timeoutSeconds);
 					upsertResult(result);
 					emit();
 					const parsed = parseJsonObject<ContextBrief>(getFinalOutput(result.messages) || result.stderr || "");
@@ -1300,7 +1320,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					const result = await runChild(spec, ctx.signal, (partial) => {
 						upsertResult(partial);
 						emit();
-					});
+					}, params.timeoutSeconds);
 					upsertResult(result);
 					emit();
 					return result;
@@ -1349,7 +1369,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 						const result = await runChild(spec, ctx.signal, (partial) => {
 							upsertResult(partial);
 							emit();
-						});
+						}, params.timeoutSeconds);
 						upsertResult(result);
 						criticResults.push(result);
 						emit();
@@ -1393,6 +1413,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 						upsertResult(partial);
 						emit();
 					},
+					params.timeoutSeconds,
 				);
 				upsertResult(integratorResult);
 				emit();
@@ -1451,7 +1472,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 				const result = await runChild(spec, ctx.signal, (partial) => {
 					upsertResult(partial);
 					emit();
-				});
+				}, params.timeoutSeconds);
 				upsertResult(result);
 				emit();
 				return result;
@@ -1488,7 +1509,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					const result = await runChild(spec, ctx.signal, (partial) => {
 						upsertResult(partial);
 						emit();
-					});
+					}, params.timeoutSeconds);
 					upsertResult(result);
 					criticResults.push(result);
 					emit();
@@ -1532,6 +1553,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					upsertResult(partial);
 					emit();
 				},
+				params.timeoutSeconds,
 			);
 			upsertResult(plannerResult);
 			emit();
@@ -1592,6 +1614,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					upsertResult(partial);
 					emit();
 				},
+				params.timeoutSeconds,
 			);
 			upsertResult(actionResult);
 			emit();
@@ -1629,6 +1652,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					upsertResult(partial);
 					emit();
 				},
+				params.timeoutSeconds,
 			);
 			upsertResult(verifierResult);
 			emit();
@@ -1692,6 +1716,7 @@ function normalizeParams(input: {
 	model?: string;
 	isolatedWorkspaces?: boolean;
 	yolo?: boolean;
+	timeoutSeconds?: number;
 	source: "command" | "tool";
 }): ProRunParams {
 	const mode = input.mode ?? "research";
@@ -1710,6 +1735,7 @@ function normalizeParams(input: {
 		model: input.model ?? DEFAULT_MODEL,
 		isolatedWorkspaces,
 		yolo: input.mode === "code" ? Boolean(input.yolo) : false,
+		timeoutSeconds: input.timeoutSeconds,
 		source: input.source,
 	};
 }
@@ -1722,6 +1748,7 @@ function parseCommandArgs(args: string, defaultMode: ProTaskMode): Omit<ProRunPa
 	let critics: number | undefined;
 	let model: string | undefined;
 	let isolatedWorkspaces: boolean | undefined;
+	let timeoutSeconds: number | undefined;
 	let yolo = false;
 	const taskParts: string[] = [];
 
@@ -1760,6 +1787,10 @@ function parseCommandArgs(args: string, defaultMode: ProTaskMode): Omit<ProRunPa
 			yolo = true;
 			continue;
 		}
+		if (token === "--timeout" || token === "-t") {
+			timeoutSeconds = Number(tokens[++i]?.replace(/^['"]|['"]$/g, "") ?? "");
+			continue;
+		}
 		if (token === "--workers" || token === "-w") {
 			workers = Number(tokens[++i]?.replace(/^['"]|['"]$/g, "") ?? "");
 			continue;
@@ -1788,6 +1819,7 @@ function parseCommandArgs(args: string, defaultMode: ProTaskMode): Omit<ProRunPa
 		model,
 		isolatedWorkspaces,
 		yolo,
+		timeoutSeconds: Number.isFinite(timeoutSeconds) ? timeoutSeconds : undefined,
 		source: "command",
 	});
 }
@@ -1858,6 +1890,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 				`Runs: ${totalRuns} (${params.strategy})`,
 				`Model: ${params.model}`,
 				params.yolo ? "YOLO: enabled" : "YOLO: disabled",
+				params.timeoutSeconds ? `Per-child timeout: ${params.timeoutSeconds}s` : "Per-child timeout: disabled",
 				`Workers: read-only planning agents`,
 				`Only one final action agent can edit the real workspace`,
 				`Context available: ${contextCount} session messages`,
@@ -2048,14 +2081,14 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	const runProCommand = async (args: string, ctx: ExtensionContext) => {
 		const params = parseCommandArgs(args, "research");
 		if (!params.task) {
-			ctx.ui.notify("Usage: /pro [--single|--fanout|--critique] [--workers N] [--critics N] [--model ID] <task>", "warning");
+			ctx.ui.notify("Usage: /pro [--single|--fanout|--critique] [--workers N] [--critics N] [--model ID] [--timeout N] <task>", "warning");
 			return;
 		}
 		await runFromCommand(ctx, params);
 	};
 
 	pi.registerCommand("pro", {
-		description: "Run Pro Mode. Flags: --single | --fanout | --critique, --workers N, --critics N, --model ID",
+		description: "Run Pro Mode. Flags: --single | --fanout | --critique, --workers N, --critics N, --model ID, --timeout N",
 		handler: async (args, ctx) => {
 			await runProCommand(args, ctx);
 		},
@@ -2071,7 +2104,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	const runProFastCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseCommandArgs(args, "research");
 		if (!parsed.task) {
-			ctx.ui.notify("Usage: /profast [--workers N] [--model ID] <task>", "warning");
+			ctx.ui.notify("Usage: /profast [--workers N] [--model ID] [--timeout N] <task>", "warning");
 			return;
 		}
 		await runFromCommand(ctx, {
@@ -2101,7 +2134,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 		const params = parseCommandArgs(args, "code");
 		if (!params.task) {
 			ctx.ui.notify(
-				"Usage: /pro-code [--single|--fanout|--critique] [--workers N] [--critics N] [--direct|--isolated] [--model ID] [--yolo] <task>",
+				"Usage: /pro-code [--single|--fanout|--critique] [--workers N] [--critics N] [--direct|--isolated] [--model ID] [--yolo] [--timeout N] <task>",
 				"warning",
 			);
 			return;
@@ -2126,7 +2159,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	const runProCodeFastCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseCommandArgs(args, "code");
 		if (!parsed.task) {
-			ctx.ui.notify("Usage: /procodefast [--workers N] [--direct|--isolated] [--model ID] [--yolo] <task>", "warning");
+			ctx.ui.notify("Usage: /procodefast [--workers N] [--direct|--isolated] [--model ID] [--yolo] [--timeout N] <task>", "warning");
 			return;
 		}
 		await runFromCommand(ctx, {
