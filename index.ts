@@ -153,6 +153,12 @@ interface ProRunParams {
 	source: "command" | "tool";
 }
 
+interface ActiveStageState {
+	name: string;
+	controller: AbortController;
+	runId: number;
+}
+
 interface SessionContextData {
 	fullThread: string;
 	recentTurns: string;
@@ -985,7 +991,7 @@ async function captureWorkspaceDiff(cwd: string, signal: AbortSignal | undefined
 	return { changedFiles, diffText };
 }
 
-async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onUpdate?: (result: RuntimeRunResult) => void, timeoutSeconds?: number): Promise<RuntimeRunResult> {
+async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onUpdate?: (result: RuntimeRunResult) => void, timeoutSeconds?: number, stageSignal?: AbortSignal): Promise<RuntimeRunResult> {
 	const runtimeResult: RuntimeRunResult = {
 		id: spec.id,
 		label: spec.label,
@@ -1018,12 +1024,19 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 		let wasAborted = false;
 		let wasTimedOut = false;
 		let wasStalled = false;
+		let wasStageSkipped = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const childController = new AbortController();
 			const forwardAbort = () => childController.abort();
+			const forwardStageAbort = () => {
+				wasStageSkipped = true;
+				childController.abort();
+			};
 			if (signal?.aborted) forwardAbort();
 			else signal?.addEventListener("abort", forwardAbort, { once: true });
+			if (stageSignal?.aborted) forwardStageAbort();
+			else stageSignal?.addEventListener("abort", forwardStageAbort, { once: true });
 			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 			let stallInterval: ReturnType<typeof setInterval> | undefined;
 			if (timeoutSeconds && timeoutSeconds > 0) {
@@ -1145,13 +1158,16 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 
 		runtimeResult.exitCode = exitCode;
 		runtimeResult.endedAt = Date.now();
-		if (wasAborted) {
-			runtimeResult.exitCode = wasTimedOut || wasStalled ? 124 : 1;
-			runtimeResult.errorMessage = runtimeResult.errorMessage || (wasTimedOut
-				? `timed out after ${timeoutSeconds}s`
-				: wasStalled
-					? `stalled for ${DEFAULT_STALL_TIMEOUT_SECONDS}s with no activity`
-					: "aborted");
+		if (wasAborted || wasStageSkipped) {
+			runtimeResult.exitCode = wasStageSkipped ? 125 : wasTimedOut || wasStalled ? 124 : 1;
+			runtimeResult.errorMessage = runtimeResult.errorMessage || (wasStageSkipped
+				? "skipped by /pro-skip"
+				: wasTimedOut
+					? `timed out after ${timeoutSeconds}s`
+					: wasStalled
+						? `stalled for ${DEFAULT_STALL_TIMEOUT_SECONDS}s with no activity`
+						: "aborted");
+			if (wasStageSkipped) runtimeResult.lastActivity = runtimeResult.lastActivity || "skipped by /pro-skip";
 			if (wasTimedOut) runtimeResult.lastActivity = runtimeResult.lastActivity || `timed out after ${timeoutSeconds}s`;
 			if (wasStalled) runtimeResult.lastActivity = runtimeResult.lastActivity || `stalled for ${DEFAULT_STALL_TIMEOUT_SECONDS}s with no activity`;
 		}
@@ -1227,6 +1243,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 	const allResults: RuntimeRunResult[] = [];
 	const startedAt = Date.now();
 	const workerWorkspaceRoots: string[] = [];
+	const runId = nextRunId++;
 	const sessionContext = extractSessionContext(ctx);
 	const conversationMessageCount = sessionContext.messageCount;
 
@@ -1238,6 +1255,13 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 
 	return withDashboard(ctx, params, conversationMessageCount, async (updateDashboard) => {
 		const emit = () => updateDashboard([...allResults]);
+		const beginStage = (name: string) => {
+			activeStage = { name, controller: new AbortController(), runId };
+		};
+		const endStage = (name: string) => {
+			if (activeStage?.runId === runId && activeStage.name === name) activeStage = null;
+		};
+		const currentStageSignal = () => (activeStage?.runId === runId ? activeStage.controller.signal : undefined);
 
 		try {
 			const shouldRunCompaction = conversationMessageCount > 0;
@@ -1254,6 +1278,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 			const contextBriefs: ContextBrief[] = [];
 
 			if (compactorVariants.length > 0) {
+				beginStage("context");
 				const contextSpecs = compactorVariants.map((variant, index) => ({
 					id: `context-${index + 1}`,
 					label: `Context Brief ${index + 1}`,
@@ -1272,13 +1297,14 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					const result = await runChild(spec, ctx.signal, (partial) => {
 						upsertResult(partial);
 						emit();
-					}, params.timeoutSeconds);
+					}, params.timeoutSeconds, currentStageSignal());
 					upsertResult(result);
 					emit();
 					const parsed = parseJsonObject<ContextBrief>(getFinalOutput(result.messages) || result.stderr || "");
 					contextBriefs[index] = normalizeContextBrief(parsed, params.task, compactorVariants[index]);
 					return result;
 				});
+				endStage("context");
 			}
 
 			const durableConstraints = mergeDurableConstraints(contextBriefs);
@@ -1333,17 +1359,19 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					}),
 				);
 
+				beginStage("research-workers");
 				researchWorkerSpecs.forEach((spec) => upsertResult(makePendingResult(spec)));
 				emit();
 				await mapWithConcurrencyLimit(researchWorkerSpecs, Math.min(researchWorkerCount, MAX_CONCURRENCY), async (spec) => {
 					const result = await runChild(spec, ctx.signal, (partial) => {
 						upsertResult(partial);
 						emit();
-					}, params.timeoutSeconds);
+					}, params.timeoutSeconds, currentStageSignal());
 					upsertResult(result);
 					emit();
 					return result;
 				});
+				endStage("research-workers");
 
 				if (params.strategy === "single") {
 					const result = allResults.find((item) => item.stage === "integrator")!;
@@ -1382,21 +1410,24 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 						};
 					});
 
+					beginStage("research-critics");
 					criticSpecs.forEach((spec) => upsertResult(makePendingResult(spec)));
 					emit();
 					await mapWithConcurrencyLimit(criticSpecs, Math.min(params.criticCount, MAX_CONCURRENCY), async (spec) => {
 						const result = await runChild(spec, ctx.signal, (partial) => {
 							upsertResult(partial);
 							emit();
-						}, params.timeoutSeconds);
+						}, params.timeoutSeconds, currentStageSignal());
 						upsertResult(result);
 						criticResults.push(result);
 						emit();
 						return result;
 					});
+					endStage("research-critics");
 				}
 
 				const integratorContext = params.strategy === "fanout" ? compactedIntegratorContext : fullContextBlock;
+				beginStage("research-integrator");
 				upsertResult(makePendingResult({
 					id: "integrator-1",
 					label: "Integrator",
@@ -1433,9 +1464,11 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 						emit();
 					},
 					params.timeoutSeconds,
+					currentStageSignal(),
 				);
 				upsertResult(integratorResult);
 				emit();
+				endStage("research-integrator");
 
 				return buildReport(
 					params,
@@ -1485,17 +1518,19 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 				}),
 			);
 
+			beginStage("code-workers");
 			workerSpecs.forEach((spec) => upsertResult(makePendingResult(spec)));
 			emit();
 			await mapWithConcurrencyLimit(workerSpecs, Math.min(codeWorkerCount, MAX_CONCURRENCY), async (spec) => {
 				const result = await runChild(spec, ctx.signal, (partial) => {
 					upsertResult(partial);
 					emit();
-				}, params.timeoutSeconds);
+				}, params.timeoutSeconds, currentStageSignal());
 				upsertResult(result);
 				emit();
 				return result;
 			});
+			endStage("code-workers");
 
 			const workerResults = allResults.filter((result) => result.stage === "worker");
 			const criticResults: RuntimeRunResult[] = [];
@@ -1522,21 +1557,24 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					};
 				});
 
+				beginStage("code-critics");
 				criticSpecs.forEach((spec) => upsertResult(makePendingResult(spec)));
 				emit();
 				await mapWithConcurrencyLimit(criticSpecs, Math.min(params.criticCount, MAX_CONCURRENCY), async (spec) => {
 					const result = await runChild(spec, ctx.signal, (partial) => {
 						upsertResult(partial);
 						emit();
-					}, params.timeoutSeconds);
+					}, params.timeoutSeconds, currentStageSignal());
 					upsertResult(result);
 					criticResults.push(result);
 					emit();
 					return result;
 				});
+				endStage("code-critics");
 			}
 
 			const plannerContext = params.strategy === "fanout" ? compactedIntegratorContext : fullContextBlock;
+			beginStage("code-planner");
 			upsertResult(makePendingResult({
 				id: "integrator-1",
 				label: "Planner",
@@ -1573,9 +1611,11 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					emit();
 				},
 				params.timeoutSeconds,
+				currentStageSignal(),
 			);
 			upsertResult(plannerResult);
 			emit();
+			endStage("code-planner");
 
 			const approvedPlanRaw = getFinalOutput(plannerResult.messages) || plannerResult.stderr || "(no plan produced)";
 			const approvedPlan = normalizePlan(parseJsonObject<StructuredPlan>(approvedPlanRaw), approvedPlanRaw);
@@ -1604,6 +1644,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 				ctx.ui.notify("YOLO enabled: skipping plan approval prompt.", "warning");
 			}
 
+			beginStage("code-action");
 			upsertResult(makePendingResult({
 				id: "action-1",
 				label: "Action Agent",
@@ -1634,14 +1675,17 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					emit();
 				},
 				params.timeoutSeconds,
+				currentStageSignal(),
 			);
 			upsertResult(actionResult);
 			emit();
+			endStage("code-action");
 
 			const { changedFiles, diffText } = await captureWorkspaceDiff(targetCwd, ctx.signal);
 			const plannedFiles = new Set(approvedPlan.files.map((file) => file.path));
 			const undeclaredFiles = changedFiles.filter((file) => !plannedFiles.has(file));
 
+			beginStage("code-verifier");
 			upsertResult(makePendingResult({
 				id: "verifier-1",
 				label: "Verifier",
@@ -1672,9 +1716,11 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 					emit();
 				},
 				params.timeoutSeconds,
+				currentStageSignal(),
 			);
 			upsertResult(verifierResult);
 			emit();
+			endStage("code-verifier");
 
 			const finalText = [
 				"## Approved Structured Plan",
@@ -1690,6 +1736,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 
 			return buildReport(params, allResults, finalText, startedAt, Date.now(), conversationMessageCount);
 		} finally {
+			if (activeStage?.runId === runId) activeStage = null;
 			await Promise.all(workerWorkspaceRoots.map((root) => rm(root, { recursive: true, force: true })));
 		}
 	});
@@ -1885,6 +1932,9 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	if (process.env.PI_PRO_MODE_CHILD === "1") {
 		return;
 	}
+
+	let activeStage: ActiveStageState | null = null;
+	let nextRunId = 1;
 
 	pi.registerMessageRenderer("pro-mode-report", (message, options, theme) => {
 		const report = message.details as ProRunReport | undefined;
@@ -2146,6 +2196,19 @@ export default function proModeExtension(pi: ExtensionAPI) {
 		description: "Shortcut for /profast",
 		handler: async (args, ctx) => {
 			await runProFastCommand(args, ctx);
+		},
+	});
+
+	pi.registerCommand("pro-skip", {
+		description: "Abort the currently running Pro Mode stage and continue with completed results",
+		handler: async (_args, ctx) => {
+			if (!activeStage) {
+				ctx.ui.notify("No active Pro Mode stage to skip.", "warning");
+				return;
+			}
+			const stageName = activeStage.name;
+			activeStage.controller.abort();
+			ctx.ui.notify(`Skipping active Pro Mode stage: ${stageName}`, "warning");
 		},
 	});
 
