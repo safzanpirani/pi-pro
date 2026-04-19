@@ -30,6 +30,7 @@ const FULL_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const MAX_WORKERS = 12;
 const MAX_CRITICS = 4;
 const MAX_CONCURRENCY = 10;
+const DEFAULT_STALL_TIMEOUT_SECONDS = 180;
 const COPY_SKIP_NAMES = new Set([
 	".git",
 	".pi",
@@ -1016,6 +1017,7 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 		const invocation = getPiInvocation(args);
 		let wasAborted = false;
 		let wasTimedOut = false;
+		let wasStalled = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const childController = new AbortController();
@@ -1023,6 +1025,7 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 			if (signal?.aborted) forwardAbort();
 			else signal?.addEventListener("abort", forwardAbort, { once: true });
 			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+			let stallInterval: ReturnType<typeof setInterval> | undefined;
 			if (timeoutSeconds && timeoutSeconds > 0) {
 				timeoutHandle = setTimeout(() => {
 					wasTimedOut = true;
@@ -1032,6 +1035,15 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 					childController.abort();
 				}, timeoutSeconds * 1000);
 			}
+			stallInterval = setInterval(() => {
+				const last = runtimeResult.lastActivityAt ?? runtimeResult.startedAt;
+				if (Date.now() - last < DEFAULT_STALL_TIMEOUT_SECONDS * 1000) return;
+				wasStalled = true;
+				runtimeResult.lastActivityAt = Date.now();
+				runtimeResult.lastActivity = `stalled for ${DEFAULT_STALL_TIMEOUT_SECONDS}s with no activity`;
+				onUpdate?.(runtimeResult);
+				childController.abort();
+			}, 1000);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: spec.cwd,
 				shell: false,
@@ -1109,12 +1121,14 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 
 			proc.on("close", (code) => {
 				if (timeoutHandle) clearTimeout(timeoutHandle);
+				if (stallInterval) clearInterval(stallInterval);
 				if (stdoutBuffer.trim()) processLine(stdoutBuffer);
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
 				if (timeoutHandle) clearTimeout(timeoutHandle);
+				if (stallInterval) clearInterval(stallInterval);
 				resolve(1);
 			});
 
@@ -1132,9 +1146,14 @@ async function runChild(spec: ChildRunSpec, signal: AbortSignal | undefined, onU
 		runtimeResult.exitCode = exitCode;
 		runtimeResult.endedAt = Date.now();
 		if (wasAborted) {
-			runtimeResult.exitCode = wasTimedOut ? 124 : 1;
-			runtimeResult.errorMessage = runtimeResult.errorMessage || (wasTimedOut ? `timed out after ${timeoutSeconds}s` : "aborted");
+			runtimeResult.exitCode = wasTimedOut || wasStalled ? 124 : 1;
+			runtimeResult.errorMessage = runtimeResult.errorMessage || (wasTimedOut
+				? `timed out after ${timeoutSeconds}s`
+				: wasStalled
+					? `stalled for ${DEFAULT_STALL_TIMEOUT_SECONDS}s with no activity`
+					: "aborted");
 			if (wasTimedOut) runtimeResult.lastActivity = runtimeResult.lastActivity || `timed out after ${timeoutSeconds}s`;
+			if (wasStalled) runtimeResult.lastActivity = runtimeResult.lastActivity || `stalled for ${DEFAULT_STALL_TIMEOUT_SECONDS}s with no activity`;
 		}
 		return runtimeResult;
 	} finally {
