@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Markdown, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	buildActionAgentSystemPrompt,
@@ -1792,6 +1792,25 @@ function parseCommandArgs(args: string, defaultMode: ProTaskMode): Omit<ProRunPa
 	});
 }
 
+function makeMarkdownTheme(theme: any) {
+	return {
+		heading: (text: string) => theme.fg("mdHeading", theme.bold(text)),
+		link: (text: string) => theme.fg("mdLink", text),
+		linkUrl: (text: string) => theme.fg("mdLinkUrl", text),
+		code: (text: string) => theme.fg("mdCode", text),
+		codeBlock: (text: string) => theme.fg("mdCodeBlock", text),
+		codeBlockBorder: (text: string) => theme.fg("mdCodeBlockBorder", text),
+		quote: (text: string) => theme.fg("mdQuote", text),
+		quoteBorder: (text: string) => theme.fg("mdQuoteBorder", text),
+		hr: (text: string) => theme.fg("mdHr", text),
+		listBullet: (text: string) => theme.fg("mdListBullet", text),
+		bold: (text: string) => theme.bold(text),
+		italic: (text: string) => theme.italic(text),
+		strikethrough: (text: string) => theme.strikethrough(text),
+		underline: (text: string) => theme.underline(text),
+	};
+}
+
 function renderBenchmarkReport(report: BenchmarkReport, theme: any): string {
 	const durationMs = Math.max(0, report.endedAt - report.startedAt);
 	let text = theme.fg("accent", theme.bold("Pro Benchmark"));
@@ -1818,8 +1837,8 @@ export default function proModeExtension(pi: ExtensionAPI) {
 
 	pi.registerMessageRenderer("pro-mode-report", (message, options, theme) => {
 		const report = message.details as ProRunReport | undefined;
-		if (!report) return new Text(message.content, 0, 0);
-		return new Text(renderReport(report, theme, options.expanded), 0, 0);
+		const content = report?.finalText ?? message.content;
+		return new Markdown(content, 0, 0, makeMarkdownTheme(theme));
 	});
 
 	pi.registerMessageRenderer("pro-benchmark-report", (message, _options, theme) => {
