@@ -147,6 +147,7 @@ interface ProRunParams {
 	criticCount: number;
 	model: string;
 	isolatedWorkspaces: boolean;
+	yolo: boolean;
 	source: "command" | "tool";
 }
 
@@ -222,6 +223,9 @@ const ProModeParams = Type.Object({
 	model: Type.Optional(Type.String({ description: "Model to use. Defaults to Fireworks Kimi K2.5 Turbo." })),
 	isolatedWorkspaces: Type.Optional(
 		Type.Boolean({ description: "For code mode, run workers in copied workspaces. Default: false for code mode." }),
+	),
+	yolo: Type.Optional(
+		Type.Boolean({ description: "Skip interactive approval prompts in code mode. Research mode ignores this flag." }),
 	),
 });
 
@@ -419,7 +423,8 @@ function calculateTotalCost(results: RuntimeRunResult[] | ResultSummary[]): numb
 	return results.reduce((sum, r) => sum + (r.usage?.cost ?? 0), 0);
 }
 
-function getContextRunCount(params: ProRunParams): number {
+function getContextRunCount(params: ProRunParams, contextMessageCount = 0): number {
+	if (contextMessageCount <= 0) return 0;
 	if (params.mode === "research") {
 		return params.strategy === "fanout" ? 2 : 0;
 	}
@@ -427,8 +432,8 @@ function getContextRunCount(params: ProRunParams): number {
 	return 1;
 }
 
-function getExpectedRunCount(params: ProRunParams): number {
-	const contextRuns = getContextRunCount(params);
+function getExpectedRunCount(params: ProRunParams, contextMessageCount = 0): number {
+	const contextRuns = getContextRunCount(params, contextMessageCount);
 	if (params.mode === "code") {
 		const workers = params.strategy === "single" ? 1 : params.workerCount;
 		const critics = params.strategy === "critique" ? params.criticCount : 0;
@@ -452,7 +457,7 @@ function chunkStatusBadges(badges: string[], chunkSize = 8): string[] {
 }
 
 function makeDashboardLines(params: ProRunParams, results: RuntimeRunResult[], contextMessageCount: number): string[] {
-	const expectedTotal = getExpectedRunCount(params);
+	const expectedTotal = getExpectedRunCount(params, contextMessageCount);
 	const done = results.filter((r) => r.exitCode !== -1).length;
 	const running = results.filter((r) => r.exitCode === -1).length;
 	const totalCost = calculateTotalCost(results);
@@ -462,7 +467,7 @@ function makeDashboardLines(params: ProRunParams, results: RuntimeRunResult[], c
 	if (params.mode === "code") {
 		const workerTotal = params.strategy === "single" ? 1 : params.workerCount;
 		const criticTotal = params.strategy === "critique" ? params.criticCount : 0;
-		const contextRuns = getContextRunCount(params);
+		const contextRuns = getContextRunCount(params, contextMessageCount);
 		const label = params.strategy === "fanout" ? "ProCodeFast" : params.strategy === "single" ? "ProCode [Single]" : "ProCode [Full]";
 		modeDisplay = `${label} ${contextRuns}+${workerTotal}+${criticTotal}+1+1+1 = ${expectedTotal} runs`;
 	} else if (params.strategy === "single") {
@@ -497,7 +502,7 @@ function makeDashboardLines(params: ProRunParams, results: RuntimeRunResult[], c
 		);
 	};
 
-	for (let i = 1; i <= getContextRunCount(params); i++) {
+	for (let i = 1; i <= getContextRunCount(params, contextMessageCount); i++) {
 		pushPlaceholder(`context-${i}`, `Context Brief ${i}`, "context", "context");
 	}
 
@@ -1151,7 +1156,7 @@ function buildReport(
 		startedAt,
 		endedAt,
 		totalCost: calculateTotalCost(results),
-		expectedRuns: getExpectedRunCount(params),
+		expectedRuns: getExpectedRunCount(params, contextMessageCount),
 		contextMessageCount,
 	};
 }
@@ -1196,14 +1201,17 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 		const emit = () => updateDashboard([...allResults]);
 
 		try {
+			const shouldRunCompaction = conversationMessageCount > 0;
 			const compactorVariants: Array<"constraints" | "questions"> =
-				params.mode === "research" && params.strategy === "fanout"
-					? ["constraints", "questions"]
-					: params.mode === "code" && params.strategy === "fanout"
+				!shouldRunCompaction
+					? []
+					: params.mode === "research" && params.strategy === "fanout"
 						? ["constraints", "questions"]
-						: params.mode === "code"
-							? ["constraints"]
-							: [];
+						: params.mode === "code" && params.strategy === "fanout"
+							? ["constraints", "questions"]
+							: params.mode === "code"
+								? ["constraints"]
+								: [];
 			const contextBriefs: ContextBrief[] = [];
 
 			if (compactorVariants.length > 0) {
@@ -1530,7 +1538,7 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 
 			const approvedPlanRaw = getFinalOutput(plannerResult.messages) || plannerResult.stderr || "(no plan produced)";
 			const approvedPlan = normalizePlan(parseJsonObject<StructuredPlan>(approvedPlanRaw), approvedPlanRaw);
-			if (ctx.hasUI) {
+			if (ctx.hasUI && !params.yolo) {
 				const ok = await ctx.ui.confirm(
 					"Approve action plan?",
 					[
@@ -1551,6 +1559,8 @@ async function runPipeline(ctx: ExtensionContext, params: ProRunParams, targetCw
 						conversationMessageCount,
 					);
 				}
+			} else if (params.yolo && ctx.hasUI) {
+				ctx.ui.notify("YOLO enabled: skipping plan approval prompt.", "warning");
 			}
 
 			upsertResult(makePendingResult({
@@ -1681,6 +1691,7 @@ function normalizeParams(input: {
 	critics?: number;
 	model?: string;
 	isolatedWorkspaces?: boolean;
+	yolo?: boolean;
 	source: "command" | "tool";
 }): ProRunParams {
 	const mode = input.mode ?? "research";
@@ -1698,6 +1709,7 @@ function normalizeParams(input: {
 		criticCount,
 		model: input.model ?? DEFAULT_MODEL,
 		isolatedWorkspaces,
+		yolo: input.mode === "code" ? Boolean(input.yolo) : false,
 		source: input.source,
 	};
 }
@@ -1710,6 +1722,7 @@ function parseCommandArgs(args: string, defaultMode: ProTaskMode): Omit<ProRunPa
 	let critics: number | undefined;
 	let model: string | undefined;
 	let isolatedWorkspaces: boolean | undefined;
+	let yolo = false;
 	const taskParts: string[] = [];
 
 	for (let i = 0; i < tokens.length; i++) {
@@ -1743,6 +1756,10 @@ function parseCommandArgs(args: string, defaultMode: ProTaskMode): Omit<ProRunPa
 			isolatedWorkspaces = true;
 			continue;
 		}
+		if (token === "--yolo") {
+			yolo = true;
+			continue;
+		}
 		if (token === "--workers" || token === "-w") {
 			workers = Number(tokens[++i]?.replace(/^['"]|['"]$/g, "") ?? "");
 			continue;
@@ -1770,6 +1787,7 @@ function parseCommandArgs(args: string, defaultMode: ProTaskMode): Omit<ProRunPa
 		critics: Number.isFinite(critics) ? critics : undefined,
 		model,
 		isolatedWorkspaces,
+		yolo,
 		source: "command",
 	});
 }
@@ -1811,15 +1829,16 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	});
 
 	async function confirmCodeRunIfNeeded(ctx: ExtensionContext, params: ProRunParams): Promise<boolean> {
-		if (params.mode !== "code" || !ctx.hasUI) return true;
-		const totalRuns = getExpectedRunCount(params);
+		if (params.mode !== "code" || !ctx.hasUI || params.yolo) return true;
 		const contextCount = countConversationMessages(ctx);
+		const totalRuns = getExpectedRunCount(params, contextCount);
 		const ok = await ctx.ui.confirm(
 			"Run Pro code mode?",
 			[
 				`Task: ${shorten(params.task, 140)}`,
 				`Runs: ${totalRuns} (${params.strategy})`,
 				`Model: ${params.model}`,
+				params.yolo ? "YOLO: enabled" : "YOLO: disabled",
 				`Workers: read-only planning agents`,
 				`Only one final action agent can edit the real workspace`,
 				`Context available: ${contextCount} session messages`,
@@ -2063,7 +2082,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 		const params = parseCommandArgs(args, "code");
 		if (!params.task) {
 			ctx.ui.notify(
-				"Usage: /pro-code [--single|--fanout|--critique] [--workers N] [--critics N] [--direct|--isolated] [--model ID] <task>",
+				"Usage: /pro-code [--single|--fanout|--critique] [--workers N] [--critics N] [--direct|--isolated] [--model ID] [--yolo] <task>",
 				"warning",
 			);
 			return;
@@ -2072,7 +2091,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("pro-code", {
-		description: "Run safe Pro Mode coding orchestration: read-only planners, one writer, one verifier",
+		description: "Run safe Pro Mode coding orchestration: read-only planners, one writer, one verifier. Use --yolo to skip approvals",
 		handler: async (args, ctx) => {
 			await runProCodeCommand(args, ctx);
 		},
@@ -2088,7 +2107,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	const runProCodeFastCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseCommandArgs(args, "code");
 		if (!parsed.task) {
-			ctx.ui.notify("Usage: /procodefast [--workers N] [--direct|--isolated] [--model ID] <task>", "warning");
+			ctx.ui.notify("Usage: /procodefast [--workers N] [--direct|--isolated] [--model ID] [--yolo] <task>", "warning");
 			return;
 		}
 		await runFromCommand(ctx, {
@@ -2102,7 +2121,7 @@ export default function proModeExtension(pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("procodefast", {
-		description: "Run a faster/lighter coding Pro Mode variant with one writer and one verifier",
+		description: "Run a faster/lighter coding Pro Mode variant with one writer and one verifier. Use --yolo to skip approvals",
 		handler: async (args, ctx) => {
 			await runProCodeFastCommand(args, ctx);
 		},
